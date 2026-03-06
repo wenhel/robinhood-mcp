@@ -1,6 +1,27 @@
 <!-- mcp-name: io.github.verygoodplugins/robinhood-mcp -->
 
-# robinhood-mcp
+# robinhood-mcp (Fixed Fork)
+
+> **Forked from [verygoodplugins/robinhood-mcp](https://github.com/verygoodplugins/robinhood-mcp)**
+
+## What's Changed in This Fork
+
+The upstream `robinhood-mcp` fails to authenticate on headless servers (like MCP environments) due to two bugs in `robin_stocks`' internal `_validate_sherrif_id` function:
+
+1. **`input()` blocks forever** — the original function calls `input()` to wait for user confirmation, which hangs indefinitely when there's no interactive terminal (e.g. running as an MCP server).
+2. **`robin_stocks` HTTP helpers return `None`** — `request_post`/`request_get` return `None` for certain valid Robinhood API responses, causing `NoneType` errors during the device-approval workflow.
+
+**This fork fixes both issues** by monkey-patching `_validate_sherrif_id` at import time with a version that:
+- Uses the standard `requests` library directly (bypassing broken `robin_stocks` helpers)
+- Polls for mobile app push notification approval instead of calling `input()`
+- Supports both TOTP and device-approval (push notification) 2FA flows
+- Prints status updates to stderr so you can monitor the approval process
+
+> **Note:** Robinhood dropped TOTP/authenticator app 2FA support in late 2024. The primary authentication method is now device approval via push notification to the Robinhood mobile app.
+
+All changes are contained in `src/robinhood_mcp/auth.py`. No other files were modified.
+
+---
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/verygoodplugins/robinhood-mcp)
 [![PyPI version](https://badge.fury.io/py/robinhood-mcp.svg)](https://badge.fury.io/py/robinhood-mcp)
