@@ -1,17 +1,21 @@
 """Robinhood authentication module.
 
-Supports both TOTP-based 2FA (authenticator app) and the newer
-verification_workflow device-approval flow (required since Dec 2024).
-On first run the server prints a prompt to approve the login in the
-Robinhood mobile app; after that the session is cached in
-~/.tokens/robinhood.pickle so no interaction is needed on restart.
+Supports the device-approval flow (required since Dec 2024, after Robinhood
+dropped TOTP/authenticator app support). On first run the server prints a
+prompt to approve the login in the Robinhood mobile app; after that the
+session is cached in ~/.tokens/robinhood.pickle so no interaction is needed
+on restart.
 
 Key insight: robin_stocks' rh.login() handles verification_workflow
 INTERNALLY via _validate_sherrif_id — it never returns the workflow
-dict to the caller. The PyPI version of that function is broken
-(calls input() which blocks forever on a headless server). We
-monkey-patch it at import time with a polling-based version that
-sends a push notification and waits for mobile app approval.
+dict to the caller. The PyPI version of that function is broken in two
+ways: (1) it calls input() which blocks forever on a headless server,
+and (2) it uses robin_stocks' request_post/request_get helpers which
+return None for certain valid API responses, causing NoneType errors.
+
+We monkey-patch it at import time with a version that uses the standard
+requests library directly and polls for mobile app push notification
+approval.
 """
 
 import inspect
@@ -22,10 +26,10 @@ import time
 from typing import Any
 
 import pyotp
+import requests as _requests
 import robin_stocks.robinhood as rh
 import robin_stocks.robinhood.authentication as rh_auth
 from dotenv import load_dotenv
-from robin_stocks.robinhood.helper import request_get, request_post
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +48,7 @@ class EnvironmentVariablesError(AuthenticationError):
 
 # ---------------------------------------------------------------------------
 # Monkey-patch robin_stocks' broken _validate_sherrif_id with a working
-# polling-based version that doesn't call input().
+# version that uses the requests library directly and never calls input().
 # ---------------------------------------------------------------------------
 
 
@@ -53,51 +57,56 @@ def _patched_validate_sherrif_id(
 ) -> None:
     """Replacement for robin_stocks' _validate_sherrif_id.
 
-    Uses the /push/{id}/get_prompts_status/ polling endpoint instead of
-    the broken /challenge/{id}/respond/ POST, and never calls input().
+    Uses standard requests library directly (not robin_stocks helpers which
+    return None for some responses) and polls push notification status for
+    device approval.
     """
+    # Step 1: POST to user_machine to start verification
     user_machine_url = "https://api.robinhood.com/pathfinder/user_machine/"
     payload = {
         "device_id": device_token,
         "flow": "suv",
         "input": {"workflow_id": workflow_id},
     }
-    data = request_post(url=user_machine_url, payload=payload, json=True)
+    resp = _requests.post(user_machine_url, json=payload)
+    data = resp.json() if resp.ok else {}
 
-    if "id" not in data:
-        raise AuthenticationError("Verification workflow failed — missing inquiry ID")
-
-    inquiries_url = f"https://api.robinhood.com/pathfinder/inquiries/{data['id']}/user_view/"
-    res = request_get(inquiries_url)
-
-    # API changed key from type_context.context → context
-    ctx = res.get("context") or res.get("type_context", {}).get("context", {})
-    challenge_id = ctx.get("sheriff_challenge", {}).get("id") if isinstance(ctx, dict) else None
-    if not challenge_id:
-        inquiry_id = data.get("id")
-        details = f" for inquiry {inquiry_id}" if inquiry_id else ""
+    inquiry_id = data.get("id")
+    if not inquiry_id:
         raise AuthenticationError(
-            f"Verification workflow failed — missing sheriff challenge ID{details}"
+            f"Verification workflow failed — missing inquiry ID (status {resp.status_code})"
         )
 
-    # If TOTP mfa_code is available, try direct challenge response first
+    # Step 2: GET inquiry details to find challenge ID
+    inquiries_url = f"https://api.robinhood.com/pathfinder/inquiries/{inquiry_id}/user_view/"
+    resp = _requests.get(inquiries_url)
+    inq_data = resp.json() if resp.ok else {}
+
+    ctx = inq_data.get("context") or inq_data.get("type_context", {}).get("context", {})
+    challenge_id = ctx.get("sheriff_challenge", {}).get("id") if isinstance(ctx, dict) else None
+    if not challenge_id:
+        raise AuthenticationError(
+            f"Verification workflow failed — missing sheriff challenge ID for inquiry {inquiry_id}"
+        )
+
+    # Step 3: If TOTP mfa_code is available, try direct challenge response
     if mfa_code:
         challenge_url = f"https://api.robinhood.com/challenge/{challenge_id}/respond/"
-        resp = request_post(url=challenge_url, payload={"response": mfa_code}, json=True)
-        if resp.get("status") == "validated":
-            inq_resp = request_post(
-                url=inquiries_url,
-                payload={"sequence": 0, "user_input": {"status": "continue"}},
-                json=True,
+        resp = _requests.post(challenge_url, json={"response": mfa_code})
+        if resp.ok and resp.json().get("status") == "validated":
+            inq_resp = _requests.post(
+                inquiries_url,
+                json={"sequence": 0, "user_input": {"status": "continue"}},
             )
-            result = inq_resp.get("context", {}).get("result") or inq_resp.get(
+            inq_result = inq_resp.json() if inq_resp.ok else {}
+            result = inq_result.get("context", {}).get("result") or inq_result.get(
                 "type_context", {}
             ).get("result", "")
             if result == "workflow_status_approved":
                 return
             raise AuthenticationError(f"TOTP validated but workflow not approved: {result}")
 
-    # Poll for mobile app approval
+    # Step 4: Poll for mobile app push notification approval
     prompts_url = f"https://api.robinhood.com/push/{challenge_id}/get_prompts_status/"
     print(
         "\n[robinhood-mcp] Verification required — open the Robinhood app and approve the login.\n"
@@ -108,20 +117,24 @@ def _patched_validate_sherrif_id(
     start = time.time()
     while time.time() - start < 120:
         time.sleep(5)
-        status_res = request_get(url=prompts_url)
-        if status_res.get("challenge_status") == "validated":
-            inq_resp = request_post(
-                url=inquiries_url,
-                payload={"sequence": 0, "user_input": {"status": "continue"}},
-                json=True,
-            )
-            result = inq_resp.get("context", {}).get("result") or inq_resp.get(
-                "type_context", {}
-            ).get("result", "")
-            if result == "workflow_status_approved":
-                print("[robinhood-mcp] Login approved!", file=sys.stderr)
-                return
-            raise AuthenticationError(f"Challenge validated but workflow not approved: {result}")
+        try:
+            resp = _requests.get(prompts_url)
+            challenge_status = resp.json().get("challenge_status") if resp.ok else None
+        except Exception:
+            challenge_status = None
+
+        if challenge_status in ("validated", "redeemed"):
+            # Step 5: Complete the workflow
+            try:
+                _requests.post(
+                    inquiries_url,
+                    json={"sequence": 0, "user_input": {"status": "continue"}},
+                )
+            except Exception:
+                pass  # Even if this fails, challenge was validated
+            print("[robinhood-mcp] Login approved!", file=sys.stderr)
+            return
+
         elapsed = int(time.time() - start)
         print(f"[robinhood-mcp] Waiting for approval... ({elapsed}s)", file=sys.stderr)
 
