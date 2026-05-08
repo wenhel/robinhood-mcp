@@ -11,11 +11,18 @@ from fastmcp import FastMCP
 from .auth import AuthenticationError, EnvironmentVariablesError, is_logged_in, login
 from .tools import (
     RobinhoodError,
+    batch_enrich,
+    batch_options,
+    batch_screen,
     get_dividends,
     get_earnings,
     get_fundamentals,
     get_historicals,
     get_news,
+    get_option_details,
+    get_option_market_data,
+    get_options_chain,
+    get_options_expirations,
     get_options_positions,
     get_portfolio,
     get_positions,
@@ -239,6 +246,131 @@ def robinhood_get_options_positions() -> list:
     """
     _ensure_logged_in()
     return get_options_positions()
+
+
+@mcp.tool()
+def robinhood_get_options_expirations(symbol: str) -> list:
+    """Get all available option expiration dates for a ticker (sorted, nearest first).
+
+    Args:
+        symbol: Stock ticker (e.g., "META", "NVDA")
+
+    Returns sorted list of YYYY-MM-DD expiration date strings.
+    """
+    _ensure_logged_in()
+    return get_options_expirations(symbol)
+
+
+@mcp.tool()
+def robinhood_get_options_chain(
+    symbol: str,
+    expiration_date: str,
+    option_type: str = "call",
+    strike_min: float | None = None,
+    strike_max: float | None = None,
+) -> list:
+    """Get the full option chain at a given expiration with live greeks (Robinhood real-time).
+
+    Each contract includes strike_price, bid/ask/adjusted_mark, delta, gamma, theta, vega,
+    rho, implied_volatility, open_interest, volume, break_even_price, chance_of_profit_long,
+    instrument_id. Sorted by strike ascending.
+
+    Args:
+        symbol: Stock ticker
+        expiration_date: 'YYYY-MM-DD' (use robinhood_get_options_expirations to find valid dates)
+        option_type: 'call' or 'put' (default 'call')
+        strike_min: Optional inclusive lower strike bound
+        strike_max: Optional inclusive upper strike bound
+
+    Returns sorted list of option contract dicts.
+    """
+    _ensure_logged_in()
+    return get_options_chain(symbol, expiration_date, option_type, strike_min, strike_max)
+
+
+@mcp.tool()
+def robinhood_get_option_details(option_id: str) -> dict:
+    """Get strike, expiration, type, and chain symbol for an option contract.
+
+    Args:
+        option_id: Option instrument UUID (from `option_id` field of an options position)
+
+    Returns dict with chain_symbol, strike_price, expiration_date, type ('call'/'put').
+    """
+    _ensure_logged_in()
+    return get_option_details(option_id)
+
+
+@mcp.tool()
+def robinhood_get_option_market_data(option_id: str) -> dict:
+    """Get live bid/ask/mark, IV, greeks (delta/gamma/theta/vega), OI, volume for an option.
+
+    Args:
+        option_id: Option instrument UUID
+
+    Returns market data dict including adjusted_mark_price, bid_price, ask_price,
+    open_interest, volume, implied_volatility, delta, gamma, theta, vega.
+    """
+    _ensure_logged_in()
+    return get_option_market_data(option_id)
+
+
+@mcp.tool()
+def robinhood_batch_screen(tickers: list) -> dict:
+    """Fetch quotes + fundamentals for ALL tickers in exactly 2 API calls.
+
+    Replaces N individual get_quote + get_fundamentals calls with a single
+    batched request per endpoint. Use this as the first step of any market scan.
+
+    Args:
+        tickers: List of stock ticker symbols, e.g. ["AAPL", "MSFT", "NVDA"]
+
+    Returns dict mapping each symbol to:
+        price, prev_close, change_pct, high_52w, low_52w, pct_from_52w_high,
+        pe_ratio (trailing), market_cap, volume, sector
+    """
+    _ensure_logged_in()
+    return batch_screen(tickers)
+
+
+@mcp.tool()
+def robinhood_batch_options(
+    tickers: list,
+    year: int = 2027,
+    strike_min: float | None = None,
+    strike_max: float | None = None,
+) -> dict:
+    """Fetch LEAPS option chains for multiple tickers in parallel.
+
+    Runs ThreadPoolExecutor(max_workers=5) internally — one concurrent
+    Robinhood API call per ticker instead of sequential calls.
+
+    Args:
+        tickers: List of ticker symbols, typically top 3-5 candidates.
+        year: Target LEAPS expiry year (default 2027; falls back to year+1).
+        strike_min: Optional lower strike bound.
+        strike_max: Optional upper strike bound.
+
+    Returns dict mapping each symbol to {expiration, contracts} or {error}.
+    """
+    _ensure_logged_in()
+    return batch_options(tickers, year, strike_min, strike_max)
+
+
+@mcp.tool()
+def robinhood_batch_enrich(tickers: list) -> dict:
+    """Fetch news + earnings for multiple tickers in parallel.
+
+    Runs ThreadPoolExecutor(max_workers=5) — parallel news + earnings
+    fetches instead of sequential MCP calls.
+
+    Args:
+        tickers: List of ticker symbols, typically top 3-5 candidates.
+
+    Returns dict mapping each symbol to {news: [...], earnings: [...]}.
+    """
+    _ensure_logged_in()
+    return batch_enrich(tickers)
 
 
 @mcp.tool()
